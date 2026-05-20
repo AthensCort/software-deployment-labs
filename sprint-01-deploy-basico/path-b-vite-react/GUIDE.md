@@ -178,7 +178,7 @@ Para usar una BD de desarrollo separada, crear un segundo proyecto en Supabase y
 - Variables `VITE_SUPABASE_URL` y `VITE_SUPABASE_ANON_KEY` con los valores del proyecto dev
 - Seleccionar solo el environment **"Preview"** para estas variables
 
----
+--- ##test de dev
 
 ## Paso 5 — Verificación final
 
