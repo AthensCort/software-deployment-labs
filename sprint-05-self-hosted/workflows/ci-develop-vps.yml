@@ -1,0 +1,157 @@
+# CI/CD — DEV (self-hosted)
+# Versión actualizada del ci-develop.yml del Sprint 4.
+# Reemplaza el deploy a Vercel por deploy directo al VPS via SSH/SCP.
+#
+# Estructura de directorios en el VPS:
+#   /var/www/dev/
+#     deploys/
+#       20240201-143022/   ← cada deploy es una carpeta con timestamp
+#       20240201-120000/
+#     current -> deploys/20240201-143022  ← symlink al deploy activo
+#
+# Secrets requeridos (además de los del Sprint 4):
+#   DEV_HOST        — IP o dominio del servidor DEV
+#   DEV_SSH_KEY     — Clave privada SSH del usuario deploy
+#   DEV_DB_URL      — URL de conexión directa a PostgreSQL del VPS
+
+name: CI/CD — DEV (self-hosted)
+
+on:
+  push:
+    branches: [develop]
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: true
+
+jobs:
+  # ── 1. Tests ─────────────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # ── 2. Migraciones en el VPS ─────────────────────────────────────────────────
+  migrate:
+    name: Aplicar migraciones → VPS DEV
+    runs-on: ubuntu-latest
+    needs: test
+    environment: development
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Aplicar migraciones al Supabase self-hosted
+        # La CLI conecta directamente al PostgreSQL del VPS
+        run: supabase db push --db-url "${{ secrets.DEV_DB_URL }}"
+
+  # ── 3. Build del frontend ────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: migrate
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      - name: Build de producción
+        run: npm run build
+        env:
+          # Path A (Next.js)
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.DEV_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.DEV_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_ENV_NAME: development
+          # Path B (Vite) — descomentar si aplica
+          # VITE_SUPABASE_URL: ${{ secrets.DEV_SUPABASE_URL }}
+          # VITE_SUPABASE_ANON_KEY: ${{ secrets.DEV_SUPABASE_ANON_KEY }}
+          # VITE_ENV_NAME: development
+          # Path C (Vite + backend) — descomentar si aplica
+          # VITE_BACKEND_URL: ${{ secrets.DEV_BACKEND_URL }}
+
+      - name: Guardar build como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          # Next.js genera en .next/  — Vite genera en dist/
+          path: |
+            .next/
+            dist/
+          retention-days: 3
+
+  # ── 4. Deploy al VPS ─────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy → VPS DEV
+    runs-on: ubuntu-latest
+    needs: build
+    environment: development
+
+    steps:
+      - name: Descargar build
+        uses: actions/download-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEV_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DEV_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Crear directorio de deploy en el servidor
+        run: |
+          DEPLOY_DIR="/var/www/dev/deploys/$(date +%Y%m%d-%H%M%S)"
+          echo "DEPLOY_DIR=$DEPLOY_DIR" >> $GITHUB_ENV
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.DEV_HOST }} \
+            "mkdir -p $DEPLOY_DIR"
+
+      - name: Copiar archivos al servidor
+        run: |
+          # Next.js: copiar .next/ y public/
+          # Vite: copiar dist/
+          # Ajustar según tu stack
+          scp -i ~/.ssh/deploy_key -r dist/* \
+            deploy@${{ secrets.DEV_HOST }}:${{ env.DEPLOY_DIR }}/
+          # Para Next.js usar:
+          # scp -i ~/.ssh/deploy_key -r .next public package.json \
+          #   deploy@${{ secrets.DEV_HOST }}:${{ env.DEPLOY_DIR }}/
+
+      - name: Activar nuevo deploy (symlink + reload Nginx)
+        run: |
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.DEV_HOST }} "
+            # Apuntar el symlink al nuevo deploy
+            ln -sfn ${{ env.DEPLOY_DIR }} /var/www/dev/current
+
+            # Recargar Nginx para servir los nuevos archivos
+            sudo systemctl reload nginx
+
+            # Limpiar deploys antiguos (conservar los 5 más recientes)
+            cd /var/www/dev/deploys
+            ls -t | tail -n +6 | xargs -r rm -rf
+
+            echo 'Deploy completado: ${{ env.DEPLOY_DIR }}'
+          "
+
+      - name: Verificar que el servidor responde
+        run: |
+          sleep 5
+          curl --fail --silent --show-error \
+            "https://${{ secrets.DEV_HOST }}" > /dev/null \
+            && echo '✅ El servidor responde correctamente' \
+            || echo '⚠️  El servidor no respondió — verificar manualmente'

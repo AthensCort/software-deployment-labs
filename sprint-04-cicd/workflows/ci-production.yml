@@ -1,0 +1,120 @@
+# CI/CD — PRODUCTION
+# Se ejecuta al mergear a main.
+# El job de deploy requiere aprobación manual del dueño de main
+# configurado en GitHub → Settings → Environments → production.
+
+name: CI/CD — PRODUCTION
+
+on:
+  push:
+    branches: [main]
+
+# NO cancelar un deploy de producción en curso
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. Tests + Lint (en paralelo) ───────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  # ── 2. Migraciones (requiere aprobación) ─────────────────────────────────────
+  # Este job pausa aquí hasta que el dueño de main apruebe en GitHub Actions
+  migrate:
+    name: Aplicar migraciones → PROD
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    environment: production      # ← PAUSA aquí esperando aprobación manual
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Aplicar migraciones
+        run: supabase db push --db-url "${{ secrets.PROD_DB_URL }}"
+
+  # ── 3. Deploy a producción ───────────────────────────────────────────────────
+  deploy:
+    name: Deploy → PRODUCTION
+    runs-on: ubuntu-latest
+    needs: migrate
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm install -g vercel
+
+      - name: Pull configuración de Vercel
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+      - name: Build de producción
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.PROD_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_ENV_NAME: production
+          # Path B/C — descomentar si aplica
+          # VITE_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          # VITE_SUPABASE_ANON_KEY: ${{ secrets.PROD_SUPABASE_ANON_KEY }}
+          # VITE_ENV_NAME: production
+
+      - name: Deploy a producción
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+  # ── 4. Tag de release ────────────────────────────────────────────────────────
+  tag:
+    name: Crear tag de release
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag con timestamp
+        run: |
+          TAG="release-$(date +%Y%m%d-%H%M%S)"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "Release: $TAG"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

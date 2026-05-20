@@ -1,0 +1,91 @@
+# CI — Pull Request
+# Se ejecuta en cada PR abierto hacia develop, staging o main.
+# NO deploya — solo verifica que el código está en buen estado.
+# Si este workflow falla, el PR no puede mergearse (con status checks activados).
+
+name: CI — Pull Request
+
+on:
+  pull_request:
+    branches: [develop, staging, main]
+
+# Cancelar runs anteriores si se pushea nuevamente al mismo PR
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Tests ────────────────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          # Si tu package.json está en una subcarpeta, cambiar a:
+          # cache-dependency-path: frontend/package-lock.json
+
+      - name: Instalar dependencias
+        run: npm ci
+        # working-directory: frontend  ← descomentar si usas subcarpeta
+
+      - name: Ejecutar tests
+        run: npm test
+        # working-directory: frontend
+        # Si no tienes tests aún, reemplazar con:
+        # run: echo "Sin tests por ahora — agregar antes del Sprint 5"
+
+  # ── Lint ─────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+        # Si no tienes lint configurado, reemplazar con:
+        # run: echo "Sin lint configurado aún"
+
+  # ── Verificar que el build no falla ─────────────────────────────────────────
+  build-check:
+    name: Build check
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Verificar build
+        run: npm run build
+        env:
+          # Variables mínimas para que el build no falle por variables faltantes
+          # Path A (Next.js)
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.DEV_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.DEV_SUPABASE_ANON_KEY }}
+          # Path B (Vite) — descomentar si aplica
+          # VITE_SUPABASE_URL: ${{ secrets.DEV_SUPABASE_URL }}
+          # VITE_SUPABASE_ANON_KEY: ${{ secrets.DEV_SUPABASE_ANON_KEY }}
+          # Path C (Vite con backend) — descomentar si aplica
+          # VITE_BACKEND_URL: ${{ secrets.DEV_BACKEND_URL }}

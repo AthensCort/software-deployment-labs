@@ -1,0 +1,178 @@
+# CI/CD — PRODUCTION (self-hosted)
+# Versión actualizada del ci-production.yml del Sprint 4.
+# Agrega backup automático antes de migrar y deploy con symlink para rollback rápido.
+#
+# Secrets requeridos:
+#   PROD_HOST       — IP o dominio del servidor de producción
+#   PROD_SSH_KEY    — Clave privada SSH del usuario deploy
+#   PROD_DB_URL     — URL directa a PostgreSQL del VPS de producción
+
+name: CI/CD — PRODUCTION (self-hosted)
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  # ── 1. Tests + Lint ───────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+
+  # ── 2. Backup + Migraciones (requiere aprobación manual) ─────────────────────
+  migrate:
+    name: Backup → Migraciones → PROD
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    environment: production      # ← PAUSA aquí esperando aprobación
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.PROD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Backup de la base de datos antes de migrar
+        run: |
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          BACKUP_FILE="/var/backups/supabase/backup_production_${TIMESTAMP}.sql"
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.PROD_HOST }} "
+            export DB_URL='${{ secrets.PROD_DB_URL }}'
+            mkdir -p /var/backups/supabase
+            pg_dump \"\$DB_URL\" \
+              --no-owner \
+              --no-privileges \
+              --format=plain \
+              --file=\"${BACKUP_FILE}\"
+            echo \"Backup creado: ${BACKUP_FILE} (\$(du -sh ${BACKUP_FILE} | cut -f1))\"
+          "
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Aplicar migraciones
+        run: supabase db push --db-url "${{ secrets.PROD_DB_URL }}"
+
+  # ── 3. Build ──────────────────────────────────────────────────────────────────
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: migrate
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      - name: Build de producción
+        run: npm run build
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.PROD_SUPABASE_ANON_KEY }}
+          NEXT_PUBLIC_ENV_NAME: production
+          # Path B/C — descomentar si aplica
+          # VITE_SUPABASE_URL: ${{ secrets.PROD_SUPABASE_URL }}
+          # VITE_SUPABASE_ANON_KEY: ${{ secrets.PROD_SUPABASE_ANON_KEY }}
+          # VITE_ENV_NAME: production
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-prod-${{ github.sha }}
+          path: |
+            .next/
+            dist/
+          retention-days: 7
+
+  # ── 4. Deploy al VPS ──────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy → VPS PRODUCTION
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-prod-${{ github.sha }}
+
+      - name: Configurar clave SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PROD_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.PROD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Crear directorio de deploy
+        run: |
+          DEPLOY_DIR="/var/www/production/deploys/$(date +%Y%m%d-%H%M%S)"
+          echo "DEPLOY_DIR=$DEPLOY_DIR" >> $GITHUB_ENV
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.PROD_HOST }} \
+            "mkdir -p $DEPLOY_DIR"
+
+      - name: Copiar archivos al servidor
+        run: |
+          scp -i ~/.ssh/deploy_key -r dist/* \
+            deploy@${{ secrets.PROD_HOST }}:${{ env.DEPLOY_DIR }}/
+
+      - name: Activar deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key deploy@${{ secrets.PROD_HOST }} "
+            ln -sfn ${{ env.DEPLOY_DIR }} /var/www/production/current
+            sudo systemctl reload nginx
+            cd /var/www/production/deploys && ls -t | tail -n +6 | xargs -r rm -rf
+            echo 'Deploy producción completado: ${{ env.DEPLOY_DIR }}'
+          "
+
+      - name: Verificar producción
+        run: |
+          sleep 10
+          curl --fail --silent "https://${{ secrets.PROD_HOST }}" > /dev/null \
+            && echo '✅ Producción responde correctamente' \
+            || (echo '❌ Producción no responde — considera hacer rollback' && exit 1)
+
+  # ── 5. Tag de release ─────────────────────────────────────────────────────────
+  tag:
+    name: Tag release
+    runs-on: ubuntu-latest
+    needs: deploy
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          TAG="release-$(date +%Y%m%d-%H%M%S)"
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "✅ Release: $TAG"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
